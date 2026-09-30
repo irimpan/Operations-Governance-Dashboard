@@ -8,7 +8,7 @@ Built for a UK FMCG food manufacturer · Qlik Sense / Qlik Cloud · SQL Server �
 > The screenshots, scripts and names here are generic and contain no real company data, connections or figures.
 > The demo load script was prepared with the help of AI tools. The approach, data model, logic and KPIs are based on a live Operations Governance app I designed, built and rolled out.
 
-![Navigation hub](Dashboard%20samples/navigation-hub.png)
+
 
 ---
 
