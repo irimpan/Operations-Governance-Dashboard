@@ -17,7 +17,7 @@ Built for a UK FMCG food manufacturer · Qlik Sense / Qlik Cloud · SQL Server �
 | | |
 |---|---|
 | **What it is** | A single governance app that brings every operations department's KPIs, scorecards and reporting into one place, with a navigation hub linking to each area |
-| **Who uses it** | Line leaders, department managers and the senior operations team |
+| **Who uses it** | Line leaders, department managers , the senior operations and Leadership team |
 | **Data** | Live production data from line scanners and pack counters, and ERP data (orders, standards, costs, materials, quality, H&S, stock) |
 | **How it runs** | Fully automated with no spreadsheets. The only manual input is meeting actions, which are recorded directly in Qlik |
 
