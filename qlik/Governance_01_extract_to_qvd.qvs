@@ -1,0 +1,60 @@
+///$tab Main
+// ============================================================================
+// OPERATIONS GOVERNANCE : step 1 - extract to QVD
+// ----------------------------------------------------------------------------
+// Demo version prepared with AI assistance, based on a live app I designed
+// and built.
+//
+// Reads each source table and stores it as a QVD file. The dashboard app
+// (Governance_demo_load_script.qvs) then loads only from these QVDs, which
+// keeps reloads fast and lets several apps share the same data.
+//
+// In the live setup each source is an ERP / SQL Server / scanner extract.
+// In this demo the sources are the simulated CSV files in /data.
+//
+// To run: create a folder connection called "Governance_Demo" with the CSV
+// files in it and an empty sub-folder called QVD, then reload this app.
+// ============================================================================
+
+SET vSource = 'lib://Governance_Demo/';
+SET vQvd    = 'lib://Governance_Demo/QVD/';
+
+// One row per source table. Adding a table = adding one row.
+SourceTables:
+LOAD * INLINE [
+TableName
+production_orders
+production_receipts
+product_master
+line_mapping
+labour_hours
+discounted_hours
+material_usage
+yield_variance
+ncr
+hs_incidents
+maintenance_daily
+stock_in_location
+meeting_actions
+audits
+];
+
+FOR t = 0 TO NoOfRows('SourceTables') - 1
+
+    LET vTable = Peek('TableName', $(t), 'SourceTables');
+
+    [$(vTable)]:
+    LOAD *
+    FROM [$(vSource)$(vTable).csv]
+    (txt, utf8, embedded labels, delimiter is ',', msq);
+
+    STORE [$(vTable)] INTO [$(vQvd)$(vTable).qvd] (qvd);
+
+    LET vRows = NoOfRows('$(vTable)');
+    TRACE >>> $(vTable): $(vRows) rows stored to QVD;
+
+    DROP TABLE [$(vTable)];
+
+NEXT t
+
+DROP TABLE SourceTables;
