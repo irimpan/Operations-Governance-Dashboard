@@ -1,0 +1,461 @@
+///$tab Main
+// ============================================================================
+// OPERATIONS GOVERNANCE DASHBOARD : demo load script
+// ----------------------------------------------------------------------------
+// Demo version prepared with AI assistance, based on a live Operations
+// Governance app I designed and built. Runs on the SIMULATED data in /data.
+//
+// In the live app the same tables come from:
+//   - line scanners / pack counters   -> production_receipts
+//   - ERP                             -> orders, products, material usage,
+//                                        yield, labour hours, NCRs, H&S, stock
+//   - maintenance system              -> maintenance_daily
+//   - Qlik (recorded in the app)      -> meeting_actions, audits
+// No spreadsheets and no manual data preparation.
+//
+// To run: upload the CSV files from /data, create a folder connection called
+// "Governance_Demo" pointing to them, paste this script and reload.
+// ============================================================================
+
+SET ThousandSep=',';
+SET DecimalSep='.';
+SET MoneyThousandSep=',';
+SET MoneyDecimalSep='.';
+SET MoneyFormat='£#,##0.00;-£#,##0.00';
+SET TimeFormat='hh:mm:ss';
+SET DateFormat='DD-MM-YYYY';
+SET TimestampFormat='DD-MM-YYYY hh:mm:ss';
+SET FirstWeekDay=6;                 // weeks run Sunday to Saturday
+SET BrokenWeeks=1;
+SET ReferenceDay=0;
+SET CollationLocale='en-GB';
+SET MonthNames='Jan;Feb;Mar;Apr;May;Jun;Jul;Aug;Sep;Oct;Nov;Dec';
+SET DayNames='Mon;Tue;Wed;Thu;Fri;Sat;Sun';
+
+SET vData = 'lib://Governance_Demo/';
+SET vCsv  = (txt, utf8, embedded labels, delimiter is ',', msq);
+
+// "Today" is fixed to the last day of the sample data so the current-week and
+// previous-week views always show data. In the live app: LET vToday = Num(Floor(Today()));
+LET vToday = Num(MakeDate(2026, 9, 26));
+
+LET vStdLabourRate = 20;            // £ per standard labour hour
+
+
+///$tab Helper functions
+// ---------------------------------------------------------------------------
+// Shared rules, defined once and used by every table. Call as $(vName(Field)).
+// Always pass a single field name, not an expression with commas.
+// ---------------------------------------------------------------------------
+SET vIsCurrentWeek  = If(WeekStart(Floor($1), 0, 6) = WeekStart($(vToday), 0, 6), 1, 0);
+SET vIsPreviousWeek = If(WeekStart(Floor($1), 0, 6) = WeekStart($(vToday) - 7, 0, 6), 1, 0);
+SET vIsToday        = If(Floor($1) = $(vToday), 1, 0);
+
+// Shifts: Day 07-15, Late 15-23, Night 23-07.
+// Hours before 07:00 belong to the previous day's night shift.
+SET vShift     = If(Hour($1) >= 7 and Hour($1) < 15, 'DAY', If(Hour($1) >= 15 and Hour($1) < 23, 'LATE', 'NIGHT'));
+SET vShiftDate = Date(If(Hour($1) < 7, Floor($1) - 1, Floor($1)));
+
+
+///$tab Mappings
+// ---------------------------------------------------------------------------
+// Lookups used while loading the fact tables
+// ---------------------------------------------------------------------------
+Map_WorkCentreLine:
+MAPPING LOAD WorkCentre, Line FROM [$(vData)line_mapping.csv] $(vCsv);
+
+Map_LineArea:
+MAPPING LOAD Line, Area FROM [$(vData)line_mapping.csv] $(vCsv);
+
+Map_SKUCaseCost:
+MAPPING LOAD SKU, StdCostPerCase FROM [$(vData)product_master.csv] $(vCsv);
+
+Map_SKULabourCost:
+MAPPING LOAD SKU, LabourCostPerCase FROM [$(vData)product_master.csv] $(vCsv);
+
+// Stock bay prefix -> area
+Map_BayArea:
+MAPPING LOAD * INLINE [
+Prefix, Area
+AIN, AREA A
+BIN, AREA B
+CIN, AREA C
+DIN, AREA D
+];
+
+// Recovered / reworked material codes
+Map_RecoveryPrefix:
+MAPPING LOAD * INLINE [
+Prefix, RecoveryType
+R1-, RECOVERY TYPE 1
+R2-, RECOVERY TYPE 2
+];
+
+// Component -> accounting group and unit cost (from material usage)
+Map_ComponentGroup:
+MAPPING LOAD DISTINCT Component, AccountingGroup
+FROM [$(vData)material_usage.csv] $(vCsv)
+WHERE Len(Trim(AccountingGroup)) > 0;
+
+Map_ComponentCost:
+MAPPING LOAD DISTINCT Component, UnitCost
+FROM [$(vData)material_usage.csv] $(vCsv);
+
+
+///$tab Product
+// ---------------------------------------------------------------------------
+// Product master and labour standards (ERP)
+// ---------------------------------------------------------------------------
+Product:
+LOAD
+    Text(SKU)                                           AS SKU,
+    Description                                         AS Product_Description,
+    ProductFamily                                       AS Product_Family,
+    AccountingGroup                                     AS Product_Accounting_Group,
+    NetWeightPerCase_kg                                 AS Net_Weight_Per_Case_kg,
+    PacksPerCase                                        AS Packs_Per_Case,
+    StdCostPerCase                                      AS Std_Cost_Per_Case,
+    LabourCostPerCase                                   AS Labour_Cost_Per_Case,
+    CrewSize                                            AS Crew_Size,
+    StdPacksPerMin                                      AS Std_Packs_Per_Min,
+    StdPacksPerMin * 60 / PacksPerCase                  AS Std_Cases_Per_Hour,
+    LabourCostPerCase / $(vStdLabourRate)               AS Std_Labour_Hrs_Per_Case
+FROM [$(vData)product_master.csv] $(vCsv);
+
+
+///$tab Production orders
+// ---------------------------------------------------------------------------
+// Production orders (ERP). Reporting date = planned finish, or today if the
+// order has started but has no planned finish yet.
+// ---------------------------------------------------------------------------
+Orders:
+LOAD
+    *,
+    Week(Order_Reporting_Date, 6)                       AS Order_Week,
+    $(vIsCurrentWeek(Order_Reporting_Date))             AS Order_IsCurrentWeek,
+    $(vIsPreviousWeek(Order_Reporting_Date))            AS Order_IsPreviousWeek,
+    $(vShift(Order_Start_TS))                           AS Order_Start_Shift,
+    $(vShiftDate(Order_Start_TS))                       AS Order_Start_ShiftDate,
+    If(Order_State = 'COMPLETED', 1, 0)                 AS Order_Awaiting_Close,
+    If(Order_State = 'COMPLETED' and Len(Order_Finish_TS) > 0,
+       $(vToday) - Floor(Order_Finish_TS))              AS Order_Days_Awaiting_Close;
+LOAD
+    *,
+    Date(If(IsNull(Order_Plan_Finish_TS), $(vToday), Floor(Order_Plan_Finish_TS))) AS Order_Reporting_Date,
+    SKU & '|' & Order_Lot_Batch                         AS %SkuBatchKey;
+LOAD
+    Upper(Trim(OrderNo))                                AS OrderNo,
+    Text(SKU)                                           AS SKU,
+    ApplyMap('Map_WorkCentreLine', WorkCentre, 'UNKNOWN')                       AS Order_Line,
+    ApplyMap('Map_LineArea', ApplyMap('Map_WorkCentreLine', WorkCentre), 'UNKNOWN') AS Order_Area,
+    Upper(Trim(OrderType))                              AS Order_Type,
+    Upper(Trim(State))                                  AS Order_State,
+    PlanQty                                             AS Order_Plan_Qty,
+    QtyComplete                                         AS Order_Qty_Complete,
+    Timestamp(Timestamp#(RealStart,  'YYYY-MM-DD hh:mm:ss'))       AS Order_Start_TS,
+    Timestamp(Timestamp#(RealFinish, 'YYYY-MM-DD hh:mm:ss'))       AS Order_Finish_TS,
+    Timestamp(Timestamp#(PlanFinish, 'YYYY-MM-DD hh:mm:ss'))       AS Order_Plan_Finish_TS,
+    LotBatch                                            AS Order_Lot_Batch
+FROM [$(vData)production_orders.csv] $(vCsv);
+
+// Order lookups for the other fact tables
+Map_OrderSKU:    MAPPING LOAD OrderNo, SKU         RESIDENT Orders;
+Map_OrderArea:   MAPPING LOAD OrderNo, Order_Area  RESIDENT Orders;
+Map_OrderLine:   MAPPING LOAD OrderNo, Order_Line  RESIDENT Orders;
+Map_OrderState:  MAPPING LOAD OrderNo, Order_State RESIDENT Orders;
+Map_OrderType:   MAPPING LOAD OrderNo, Order_Type  RESIDENT Orders;
+
+
+///$tab Production and recovered hours
+// ---------------------------------------------------------------------------
+// Production receipts from the line scanners (cases, by timestamp).
+// Recovered hours = signed cases x labour cost per case / standard labour rate
+// ---------------------------------------------------------------------------
+Production_Receipts:
+LOAD
+    *,
+    Rec_Area & '|' & Text(Rec_ShiftDate) & '|' & Rec_Shift                     AS %ShiftKey,
+    Rec_Signed_Cases * ApplyMap('Map_SKULabourCost', ApplyMap('Map_OrderSKU', OrderNo), 0)
+        / $(vStdLabourRate)                                                    AS Recovered_Hours,
+    Rec_Signed_Cases * ApplyMap('Map_SKUCaseCost', ApplyMap('Map_OrderSKU', OrderNo), 0)
+                                                                               AS Rec_Std_Value;
+LOAD
+    *,
+    If(Rec_Direction = '+', Rec_Cases, -Rec_Cases)                             AS Rec_Signed_Cases,
+    $(vShift(Rec_TS))                                                          AS Rec_Shift,
+    $(vShiftDate(Rec_TS))                                                      AS Rec_ShiftDate,
+    Hour(Rec_TS)                                                               AS Rec_Hour,
+    ApplyMap('Map_OrderArea', OrderNo, 'UNKNOWN')                              AS Rec_Area,
+    ApplyMap('Map_OrderLine', OrderNo, 'UNKNOWN')                              AS Rec_Line;
+LOAD
+    Timestamp(Timestamp#([Timestamp], 'YYYY-MM-DD hh:mm:ss'))                             AS Rec_TS,
+    Upper(Trim(OrderNo))                                                       AS OrderNo,
+    Trim(Direction)                                                            AS Rec_Direction,
+    QtyCases                                                                   AS Rec_Cases
+FROM [$(vData)production_receipts.csv] $(vCsv);
+
+
+///$tab Worked hours
+// ---------------------------------------------------------------------------
+// Worked and discounted hours by area and shift (ERP labour data)
+// ---------------------------------------------------------------------------
+Worked_Hours:
+LOAD
+    *,
+    Hrs_Area & '|' & Text(Hrs_Date) & '|' & Hrs_Shift  AS %ShiftKey,
+    Full_Time_Hours + Agency_Hours                      AS Worked_Hours;
+LOAD
+    Date(Date#([Date], 'YYYY-MM-DD'))                         AS Hrs_Date,
+    Upper(Trim(Shift))                                  AS Hrs_Shift,
+    Upper(Trim(Area))                                   AS Hrs_Area,
+    FullTimeHours                                       AS Full_Time_Hours,
+    AgencyHours                                         AS Agency_Hours,
+    LinesRunning                                        AS Lines_Running,
+    PlannedCases                                        AS Planned_Cases
+FROM [$(vData)labour_hours.csv] $(vCsv);
+
+// Discounted hours, summarised per shift and split by reason
+LEFT JOIN (Worked_Hours)
+LOAD
+    %ShiftKey,
+    Sum(Disc_Hours)                                                AS Discounted_Hours,
+    Sum(If(Disc_Reason = 'REWORK',   Disc_Hours, 0))               AS Discounted_Rework,
+    Sum(If(Disc_Reason = 'TRAINING', Disc_Hours, 0))               AS Discounted_Training,
+    Sum(If(Disc_Reason = 'TRIALS',   Disc_Hours, 0))               AS Discounted_Trials,
+    Sum(If(Disc_Reason = 'BRIEFS',   Disc_Hours, 0))               AS Discounted_Briefs,
+    Concat(DISTINCT Disc_Reason, ', ')                             AS Discount_Reasons
+GROUP BY %ShiftKey;
+LOAD
+    Upper(Trim(Area)) & '|' & Text(Date(Date#([Date], 'YYYY-MM-DD'))) & '|' & Upper(Trim(Shift))   AS %ShiftKey,
+    Hours                                                          AS Disc_Hours,
+    Upper(Trim(Reason))                                            AS Disc_Reason
+FROM [$(vData)discounted_hours.csv] $(vCsv);
+
+
+///$tab Shift dimension
+// ---------------------------------------------------------------------------
+// One row per area / date / shift that has output OR worked hours.
+// Receipts and worked hours both link here, so shift hours are never
+// repeated across transaction rows.
+// ---------------------------------------------------------------------------
+Shift_Tmp:
+LOAD %ShiftKey AS Tmp_Key, Rec_Area AS Tmp_Area, Rec_ShiftDate AS Tmp_Date, Rec_Shift AS Tmp_Shift
+RESIDENT Production_Receipts;
+
+CONCATENATE (Shift_Tmp)
+LOAD %ShiftKey AS Tmp_Key, Hrs_Area AS Tmp_Area, Hrs_Date AS Tmp_Date, Hrs_Shift AS Tmp_Shift
+RESIDENT Worked_Hours;
+
+Shift_Dim:
+NoConcatenate
+LOAD DISTINCT
+    Tmp_Key                              AS %ShiftKey,
+    Tmp_Area                             AS Area,
+    Tmp_Date                             AS Shift_Date,
+    Tmp_Shift                            AS Shift,
+    Week(Tmp_Date, 6)                    AS Shift_Week,
+    Date(WeekStart(Tmp_Date, 0, 6))      AS Shift_Week_Start,
+    WeekDay(Tmp_Date)                    AS Shift_Weekday,
+    $(vIsCurrentWeek(Tmp_Date))          AS Shift_IsCurrentWeek,
+    $(vIsPreviousWeek(Tmp_Date))         AS Shift_IsPreviousWeek,
+    $(vIsToday(Tmp_Date))                AS Shift_IsToday
+RESIDENT Shift_Tmp;
+
+DROP TABLE Shift_Tmp;
+
+DROP FIELDS Rec_Area, Rec_ShiftDate, Rec_Shift FROM Production_Receipts;
+DROP FIELDS Hrs_Area, Hrs_Date, Hrs_Shift FROM Worked_Hours;
+
+
+///$tab Waste and yield
+// ---------------------------------------------------------------------------
+// Material waste for CLOSED manufacturing orders only.
+// A recovered component with a negative quantity and a shrinkage factor is a
+// planned recovery, not waste -> value 0. Recovered material is re-classified
+// to the accounting group of the original material.
+// ---------------------------------------------------------------------------
+Waste:
+LOAD
+    *,
+    If(Waste_Planned_Recovery = 1, 0, Waste_Min_Var_Qty * Waste_Unit_Cost)          AS Waste_Value,
+    If(Waste_Consumed_Type = 'CONSUMED' and Waste_Planned_Recovery = 0,
+       Waste_Min_Var_Qty * Waste_Unit_Cost, 0)                                       AS Actual_Waste_Cost,
+    If(Waste_Consumed_Type = 'CONSUMED' and Waste_Planned_Recovery = 0,
+       Waste_Min_Plus_Var_Qty * Waste_Unit_Cost, 0)                                  AS Waste_Variance_Value;
+LOAD
+    *,
+    If(Len(Waste_Recovery_Type) > 0,
+       ApplyMap('Map_ComponentGroup', Mid(Waste_Component, 4), Waste_Recovery_Type),
+       Waste_Component_Group)                                                        AS Waste_Accounting_Group,
+    If(Len(Waste_Recovery_Type) > 0 and Waste_Actual_Qty < 0 and Waste_Shrinkage > 0, 1, 0)
+                                                                                     AS Waste_Planned_Recovery;
+LOAD
+    Upper(Trim(OrderNo))                                                AS OrderNo,
+    Upper(Trim(Component))                                              AS Waste_Component,
+    ComponentDesc                                                       AS Waste_Component_Desc,
+    Upper(Trim(AccountingGroup))                                        AS Waste_Component_Group,
+    ApplyMap('Map_RecoveryPrefix', Left(Upper(Trim(Component)), 3), Null())         AS Waste_Recovery_Type,
+    Upper(Trim(ConsumedType))                                           AS Waste_Consumed_Type,
+    UnitCost                                                            AS Waste_Unit_Cost,
+    ActualQty                                                           AS Waste_Actual_Qty,
+    MinVarQty                                                           AS Waste_Min_Var_Qty,
+    MinPlusVarQty                                                       AS Waste_Min_Plus_Var_Qty,
+    Alt(ShrinkageFactor, 0)                                             AS Waste_Shrinkage
+FROM [$(vData)material_usage.csv] $(vCsv)
+WHERE ApplyMap('Map_OrderState', Upper(Trim(OrderNo))) = 'CLOSED'
+  and ApplyMap('Map_OrderType',  Upper(Trim(OrderNo))) = 'MANUFACTURING';
+
+// Yield and giveaway per order (ERP)
+Yield:
+LOAD
+    Upper(Trim(OrderNo))                                AS OrderNo,
+    StdYieldPct / 100                                   AS Yield_Std_Pct,
+    ActualYieldPct / 100                                AS Yield_Actual_Pct,
+    YieldVariance_GBP                                   AS Yield_Variance_GBP,
+    GiveawayVar_g                                       AS Giveaway_Var_g,
+    GiveawayVar_GBP                                     AS Giveaway_Var_GBP
+FROM [$(vData)yield_variance.csv] $(vCsv);
+
+
+///$tab Quality
+// ---------------------------------------------------------------------------
+// NCRs. The description is recorded in a fixed format and split into fields:
+// CAT .. SUB CAT .. MANUFACTURING yes/no .. FLM .. OPERATIVE .. COMMENTS ..
+// QTY <n> CASES|KG .. INV VALUE <£> .. RFT
+// ---------------------------------------------------------------------------
+NCR:
+LOAD
+    *,
+    Trim(TextBetween(NCR_Description, 'CAT', 'SUB CAT'))                        AS NCR_Category,
+    Trim(TextBetween(NCR_Description, 'SUB CAT', 'MANUFACTURING'))              AS NCR_Sub_Category,
+    If(WildMatch(TextBetween(NCR_Description, 'MANUFACTURING', 'FLM'), '*YES*'), 'YES', 'NO')
+                                                                                AS NCR_Manufacturing,
+    Trim(TextBetween(NCR_Description, 'FLM', 'OPERATIVE'))                      AS NCR_First_Line_Manager,
+    Trim(TextBetween(NCR_Description, 'OPERATIVE', 'COMMENTS'))                 AS NCR_Operative,
+    Trim(TextBetween(NCR_Description, 'COMMENTS', 'QTY'))                       AS NCR_Comments,
+    Num#(KeepChar(TextBetween(NCR_Description, 'QTY', 'INV VALUE'), '0123456789.'))
+                                                                                AS NCR_Qty_On_Hold,
+    If(WildMatch(TextBetween(NCR_Description, 'QTY', 'INV VALUE'), '*CASES*'), 'CASES', 'KG')
+                                                                                AS NCR_Qty_Unit,
+    Num#(KeepChar(TextBetween(NCR_Description, 'INV VALUE', 'RFT'), '0123456789.'))
+                                                                                AS NCR_Inventory_Value,
+    $(vShift(NCR_TS))                                                           AS NCR_Shift,
+    $(vShiftDate(NCR_TS))                                                       AS NCR_ShiftDate,
+    Week(NCR_TS, 6)                                                             AS NCR_Week,
+    $(vIsCurrentWeek(NCR_TS))                                                   AS NCR_IsCurrentWeek,
+    $(vIsPreviousWeek(NCR_TS))                                                  AS NCR_IsPreviousWeek;
+LOAD
+    NCR_No,
+    Text(SKU) & '|' & LotBatch                                                  AS %SkuBatchKey,
+    Timestamp(Timestamp#(DateCreated, 'YYYY-MM-DD hh:mm:ss'))                              AS NCR_TS,
+    Upper(Description)                                                          AS NCR_Description,
+    Upper(Trim(State))                                                          AS NCR_State
+FROM [$(vData)ncr.csv] $(vCsv);
+
+
+///$tab Health and safety
+// ---------------------------------------------------------------------------
+// Incidents. Severity text "0 - No Injury" ... "5 - Reportable" is split into
+// a code and a description, with flags for the KPI tiles.
+// ---------------------------------------------------------------------------
+Incidents:
+LOAD
+    *,
+    Date(Floor(Inc_TS))                                 AS Inc_Date,
+    $(vIsCurrentWeek(Inc_TS))                           AS Inc_IsCurrentWeek,
+    $(vIsPreviousWeek(Inc_TS))                          AS Inc_IsPreviousWeek,
+    Num(Left(Inc_Severity, 1))                          AS Inc_Severity_Code,
+    Trim(SubField(Inc_Severity, '-', 2))                AS Inc_Severity_Desc,
+    If(Num(Left(Inc_Severity, 1)) = 0,  1, 0)           AS Inc_Is_No_Injury,
+    If(Num(Left(Inc_Severity, 1)) > 0,  1, 0)           AS Inc_Is_Injury,
+    If(Num(Left(Inc_Severity, 1)) >= 4, 1, 0)           AS Inc_Is_Lost_Time,
+    If(Num(Left(Inc_Severity, 1)) = 5,  1, 0)           AS Inc_Is_Reportable;
+LOAD
+    IncidentNo                                          AS Inc_No,
+    Timestamp(Timestamp#(IncidentDate, 'YYYY-MM-DD hh:mm:ss'))     AS Inc_TS,
+    IncidentType                                        AS Inc_Type,
+    Upper(Trim(Area))                                   AS Inc_Area,
+    SeverityLevel                                       AS Inc_Severity,
+    Upper(Trim(State))                                  AS Inc_State
+FROM [$(vData)hs_incidents.csv] $(vCsv);
+
+
+///$tab Engineering
+// ---------------------------------------------------------------------------
+// Daily breakdown minutes, planned maintenance and open jobs (maintenance system)
+// ---------------------------------------------------------------------------
+Engineering:
+LOAD
+    *,
+    Week(Eng_Date, 6)                                   AS Eng_Week,
+    $(vIsCurrentWeek(Eng_Date))                         AS Eng_IsCurrentWeek,
+    $(vIsPreviousWeek(Eng_Date))                        AS Eng_IsPreviousWeek;
+LOAD
+    Date(Date#([Date], 'YYYY-MM-DD'))                         AS Eng_Date,
+    Upper(Trim(Area))                                   AS Eng_Area,
+    BreakdownMins                                       AS Eng_Breakdown_Mins,
+    PPMsCompleted                                       AS Eng_PPMs_Completed,
+    OpenJobs                                            AS Eng_Open_Jobs
+FROM [$(vData)maintenance_daily.csv] $(vCsv);
+
+
+///$tab Stock in location
+// ---------------------------------------------------------------------------
+// Stock in goods-in / hold locations (bay codes ending in "IN"), not reserved,
+// valued at standard cost: finished SKU cost per case, else component cost.
+// ---------------------------------------------------------------------------
+Stock_In_Location:
+LOAD
+    *,
+    Stock_Qty * Stock_Std_Cost                          AS Stock_Value;
+LOAD
+    Date($(vToday))                                     AS Stock_Snapshot_Date,
+    Upper(Trim(PartNo))                                 AS Stock_Part_No,
+    Upper(Trim(Bay))                                    AS Stock_Bay,
+    Warehouse                                           AS Stock_Warehouse,
+    ApplyMap('Map_BayArea', Left(Upper(Trim(Bay)), 3), 'OTHER')                 AS Stock_Area,
+    QtyOnHand                                           AS Stock_Qty,
+    Alt(ApplyMap('Map_SKUCaseCost',   Text(PartNo), Null()),
+        ApplyMap('Map_ComponentCost', Upper(Trim(PartNo)), 0))                  AS Stock_Std_Cost
+FROM [$(vData)stock_in_location.csv] $(vCsv)
+WHERE WildMatch(Upper(Trim(Bay)), '*IN')
+  and QtyOnHand > 0
+  and QtyReserved = 0;
+
+
+///$tab Actions and audits
+// ---------------------------------------------------------------------------
+// Meeting actions and audit results are recorded directly in the Qlik app
+// (no spreadsheets). Here they are loaded from the demo CSV files.
+// ---------------------------------------------------------------------------
+Actions:
+LOAD
+    *,
+    If(Act_Status <> 'CLOSED' and Act_Due_Date < $(vToday), 1, 0)              AS Act_Is_Overdue,
+    If(Act_Status = 'CLOSED' and Act_Completed_Date <= Act_Due_Date, 1, 0)     AS Act_Closed_On_Time,
+    $(vIsCurrentWeek(Act_Date))                                                AS Act_IsCurrentWeek,
+    $(vIsPreviousWeek(Act_Date))                                               AS Act_IsPreviousWeek;
+LOAD
+    ActionID                                            AS Act_ID,
+    Date(Date#(ActionDate, 'YYYY-MM-DD'))                     AS Act_Date,
+    Upper(Trim(Area))                                   AS Act_Area,
+    Meeting                                             AS Act_Meeting,
+    Issue                                               AS Act_Issue,
+    Owner                                               AS Act_Owner,
+    Date(Date#(DueDate, 'YYYY-MM-DD'))                        AS Act_Due_Date,
+    Upper(Trim(Status))                                 AS Act_Status,
+    Date(Date#(CompletedDate, 'YYYY-MM-DD'))                  AS Act_Completed_Date
+FROM [$(vData)meeting_actions.csv] $(vCsv);
+
+Audits:
+LOAD
+    *,
+    Week(Audit_Date, 6)                                 AS Audit_Week,
+    $(vIsCurrentWeek(Audit_Date))                       AS Audit_IsCurrentWeek,
+    $(vIsPreviousWeek(Audit_Date))                      AS Audit_IsPreviousWeek;
+LOAD
+    Date(Date#(AuditDate, 'YYYY-MM-DD'))                      AS Audit_Date,
+    Upper(Trim(Area))                                   AS Audit_Area,
+    AuditType                                           AS Audit_Type,
+    Score / 100                                         AS Audit_Score
+FROM [$(vData)audits.csv] $(vCsv);
